@@ -1812,7 +1812,50 @@ class Accelerator:
                         if type(scheduler).__name__ in deepspeed.runtime.lr_schedules.VALID_LR_SCHEDULES:
                             kwargs["lr_scheduler"] = scheduler
 
-            engine, optimizer, _, lr_scheduler = deepspeed.initialize(**kwargs)
+            @contextmanager
+            def maybe_compile():
+                ds_compile = compare_versions("deepspeed", ">=", "0.14.4") and self.state.dynamo_plugin.backend != DynamoBackend.NO
+
+                def trigger_compile(engine):
+                    if ds_compile:
+                        compile_kwargs = self.state.dynamo_plugin.to_kwargs()
+                        engine.compile(backend=compile_kwargs.pop("backend"), compile_kwargs=compile_kwargs)
+
+                try:
+                    from deepspeed.utils import z3_leaf_module, set_z3_leaf_modules
+                    # from deepspeed.runtime.compiler import DISABLE_OPT_DYNAMO_OPTIMIZE, VERBOSE_OPT_DYNAMO_OPTIMIZE
+                    DISABLE_OPT_DYNAMO_OPTIMIZE = False
+                    VERBOSE_OPT_DYNAMO_OPTIMIZE = True
+                    if ds_compile and not DISABLE_OPT_DYNAMO_OPTIMIZE:
+                        import torch
+                        # heuristic to set leaf node
+                        modulelists = []
+
+                        for module in model.modules():
+                            if z3_leaf_module(module):
+                                # have leaf set
+                                modulelists.clear()
+                                if VERBOSE_OPT_DYNAMO_OPTIMIZE:
+                                    self.print(f'[comp] leaf set: {module.__class__}')
+                                break
+                            elif isinstance(module, torch.nn.ModuleList):
+                                # whatever in `ModuleList`
+                                from collections import Counter
+                                classes = list(Counter([i.__class__ for i in iter(module)]).items())
+                                if classes and classes[0][1] > 1:
+                                    modulelists.append(classes[0][0])
+                        if modulelists:
+                            set_z3_leaf_modules(model, modulelists)
+                            if VERBOSE_OPT_DYNAMO_OPTIMIZE:
+                                self.print(f'[comp] set leaf to {modulelists} and reinitialize z3 hooks')
+                finally:
+                    yield trigger_compile
+
+            with maybe_compile() as c:
+                engine, optimizer, _, lr_scheduler = deepspeed.initialize(**kwargs)
+
+                c(engine)
+
             if optimizer is not None:
                 optimizer = DeepSpeedOptimizerWrapper(optimizer)
             if scheduler is not None:
